@@ -33,6 +33,7 @@
   const MAX_FILES   = 10;
   const POLL_MS     = 800;
   const DATA_CHUNK_SIZE = 256 * 1024; // chunk large base64 values into 256KB pieces
+  const LARGE_VIDEO_THRESHOLD_BYTES = 30 * 1024 * 1024;
 
   const DEBUG = false;
   const log  = (...a) => console.log('[GP→Messenger]', ...a);
@@ -295,7 +296,7 @@
             const blob = await fetchBlob(url);
             if (blob && blob.size > 0 && (blob.type.startsWith('video/') || blob.type.includes('stream'))) {
               log(`✓ Video blob fetched: ${blob.type}, ${blob.size} bytes`);
-              return blob;
+              return { blob, sourceUrl: url };
             }
           } catch (err) {
             warn(`Video URL candidate failed: ${url.slice(0, 60)}`, err.message);
@@ -443,12 +444,28 @@
   async function saveQueue(queue) {
     const metadata = [];
     for (const item of queue) {
-      const itemId = `item_${Date.now()}_${Math.random().toString(36).slice(2, 10)}`;
-      const chunks = chunkString(item.dataUrl, DATA_CHUNK_SIZE);
-      for (let index = 0; index < chunks.length; index++) {
-        await GM_setValue(generateChunkKey(itemId, index), chunks[index]);
+      if (item.transferMode === 'remoteFetch') {
+        metadata.push({
+          transferMode: 'remoteFetch',
+          filename: item.filename,
+          mimeType: item.mimeType,
+          sourceUrl: item.sourceUrl,
+          sizeBytes: item.sizeBytes || null,
+        });
+      } else {
+        const itemId = `item_${Date.now()}_${Math.random().toString(36).slice(2, 10)}`;
+        const chunks = chunkString(item.dataUrl, DATA_CHUNK_SIZE);
+        for (let index = 0; index < chunks.length; index++) {
+          await GM_setValue(generateChunkKey(itemId, index), chunks[index]);
+        }
+        metadata.push({
+          transferMode: 'inlineDataUrl',
+          id: itemId,
+          filename: item.filename,
+          mimeType: item.mimeType,
+          chunkCount: chunks.length
+        });
       }
-      metadata.push({ id: itemId, filename: item.filename, mimeType: item.mimeType, chunkCount: chunks.length });
     }
     await GM_setValue(STORAGE_KEY, JSON.stringify(metadata));
     return metadata;
@@ -469,13 +486,23 @@
     if (!metadata?.length) return null;
     const queue = [];
     for (const item of metadata) {
+      if (item.transferMode === 'remoteFetch') {
+        queue.push({
+          transferMode: 'remoteFetch',
+          filename: item.filename,
+          mimeType: item.mimeType,
+          sourceUrl: item.sourceUrl,
+          sizeBytes: item.sizeBytes || null,
+        });
+        continue;
+      }
       let dataUrl = '';
       for (let index = 0; index < item.chunkCount; index++) {
         const chunk = await GM_getValue(generateChunkKey(item.id, index), null);
         if (chunk === null) throw new Error(`Missing queue chunk ${index} for ${item.id}`);
         dataUrl += chunk;
       }
-      queue.push({ filename: item.filename, mimeType: item.mimeType, dataUrl });
+      queue.push({ transferMode: 'inlineDataUrl', filename: item.filename, mimeType: item.mimeType, dataUrl });
     }
     return queue;
   }
@@ -484,6 +511,7 @@
     const metadata = await getQueueMetadata();
     if (metadata?.length) {
       for (const item of metadata) {
+        if (!item.id || !item.chunkCount) continue;
         for (let index = 0; index < item.chunkCount; index++) {
           await GM_deleteValue(generateChunkKey(item.id, index));
         }
@@ -517,22 +545,39 @@
       try {
         const item = selected[i];
         let blob;
+        let sourceUrl = null;
 
         if (item.type === 'video') {
           // For videos: fetch via detail page URL extraction
-          blob = await fetchVideoBlob(item);
+          const videoResult = await fetchVideoBlob(item);
+          blob = videoResult.blob;
+          sourceUrl = videoResult.sourceUrl;
         } else {
           // For images: fetch full resolution
           blob = await fetchBlob(getFullResUrl(item.thumbSrc));
         }
 
-        const b64  = await blobToBase64(blob);
         const ext  = blob.type.includes('video') ? 'mp4' : (blob.type.split('/')[1] || 'jpg');
-        queue.push({ 
-          dataUrl: b64, 
-          mimeType: blob.type, 
-          filename: `media_${i + 1}.${ext}` 
-        });
+        const filename = `media_${i + 1}.${ext}`;
+
+        if (item.type === 'video' && blob.size > LARGE_VIDEO_THRESHOLD_BYTES && sourceUrl) {
+          queue.push({
+            transferMode: 'remoteFetch',
+            sourceUrl,
+            mimeType: blob.type || 'video/mp4',
+            filename,
+            sizeBytes: blob.size,
+          });
+          log(`Queued large video via remoteFetch mode: ${blob.size} bytes`);
+        } else {
+          const b64  = await blobToBase64(blob);
+          queue.push({
+            transferMode: 'inlineDataUrl',
+            dataUrl: b64,
+            mimeType: blob.type,
+            filename
+          });
+        }
         log(`Fetched item ${i + 1} (${item.type}):`, blob.type, blob.size, 'bytes');
       } catch (err) {
         warn(`Failed item ${i + 1}:`, err);
@@ -546,6 +591,11 @@
       return alert('Could not download any selected items.'); 
     }
 
+    const largeVideoCount = queue.filter(item => item.transferMode === 'remoteFetch').length;
+    if (largeVideoCount > 0) {
+      updatePanel(`Queuing ${queue.length} file(s), including ${largeVideoCount} large video(s)…`);
+      await sleep(600);
+    }
     updatePanel(`Queuing ${queue.length} file(s)… opening Messenger.`);
     await saveQueue(queue);
     await sleep(400);
@@ -721,13 +771,34 @@
       return;
     }
 
-    // ── Reconstruct File objects from stored base64 ────────────────────────
-    const files = queue.map(item => {
-      const bin   = atob(item.dataUrl.split(',')[1]);
-      const bytes = new Uint8Array(bin.length);
-      for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
-      return new File([bytes], item.filename, { type: item.mimeType });
-    });
+    // ── Reconstruct File objects (inline base64 or delayed remote fetch) ───
+    const files = [];
+    for (const item of queue) {
+      if (item.transferMode === 'remoteFetch') {
+        showPanel(`Downloading large video for Messenger: ${item.filename}…`);
+        try {
+          const remoteBlob = await fetchBlob(item.sourceUrl);
+          if (!remoteBlob || remoteBlob.size === 0) {
+            throw new Error('Remote blob is empty');
+          }
+          files.push(new File([remoteBlob], item.filename, { type: item.mimeType || remoteBlob.type || 'video/mp4' }));
+        } catch (err) {
+          warn(`Failed delayed fetch for ${item.filename}:`, err);
+          alert(
+            '[GP→Messenger] Failed to re-download a large video before upload.\n\n' +
+            'Please try again from Google Photos and keep both tabs logged in.'
+          );
+          return;
+        } finally {
+          hidePanel();
+        }
+      } else {
+        const bin   = atob(item.dataUrl.split(',')[1]);
+        const bytes = new Uint8Array(bin.length);
+        for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+        files.push(new File([bytes], item.filename, { type: item.mimeType }));
+      }
+    }
 
     // ── Strategy 1: inject via Facebook's hidden file input ───────────────
     // Facebook Messenger (on facebook.com) keeps a hidden <input type="file">
