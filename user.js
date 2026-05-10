@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Google Photos → Facebook Messenger (Direct Upload) + Album
 // @namespace    https://github.com/TomVarga/PhotosToMessengerUserscript
-// @version      1.4.3
+// @version      1.4.4
 // @description  Select photos/videos in Google Photos and send them directly to a Messenger chat as file uploads, AND add to a Google Photos album.
 // @updateURL    https://github.com/TomVarga/PhotosToMessengerUserscript/raw/refs/heads/main/user.js
 // @downloadURL  https://github.com/TomVarga/PhotosToMessengerUserscript/raw/refs/heads/main/user.js
@@ -467,6 +467,16 @@
     return `${STORAGE_KEY}_chunk_${itemId}_${index}`;
   }
 
+  function deleteInlineChunksFromMetadata(metadata) {
+    if (!Array.isArray(metadata) || !metadata.length) return;
+    for (const item of metadata) {
+      if (!item.id || !item.chunkCount) continue;
+      for (let index = 0; index < item.chunkCount; index++) {
+        GM_deleteValue(generateChunkKey(item.id, index));
+      }
+    }
+  }
+
   function hasExpectedMimeType(blob, mediaKind) {
     const type = (blob && blob.type ? blob.type : '').toLowerCase();
     if (!type) return false;
@@ -477,6 +487,7 @@
 
   // FIXED: Removed async/await from GM storage functions (they are synchronous)
   async function saveQueue(queue) {
+    deleteInlineChunksFromMetadata(getQueueMetadata());
     const metadata = [];
     for (const item of queue) {
       if (item.transferMode === 'remoteFetch') {
@@ -544,15 +555,7 @@
   }
 
   async function clearQueue() {
-    const metadata = getQueueMetadata();
-    if (metadata?.length) {
-      for (const item of metadata) {
-        if (!item.id || !item.chunkCount) continue;
-        for (let index = 0; index < item.chunkCount; index++) {
-          GM_deleteValue(generateChunkKey(item.id, index));
-        }
-      }
-    }
+    deleteInlineChunksFromMetadata(getQueueMetadata());
     GM_setValue(STORAGE_KEY, null);
   }
 
