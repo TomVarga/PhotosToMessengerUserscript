@@ -1,11 +1,11 @@
 // ==UserScript==
 // @name         Google Photos → Facebook Messenger (Direct Upload) + Album
-// @namespace    https://github.com/you/gphoto-to-messenger
-// @version      1.4.2
+// @namespace    https://github.com/TomVarga/PhotosToMessengerUserscript
+// @version      1.4.3
 // @description  Select photos/videos in Google Photos and send them directly to a Messenger chat as file uploads, AND add to a Google Photos album.
 // @updateURL    https://github.com/TomVarga/PhotosToMessengerUserscript/raw/refs/heads/main/user.js
 // @downloadURL  https://github.com/TomVarga/PhotosToMessengerUserscript/raw/refs/heads/main/user.js
-// @author       You
+// @author       Tom Varga
 // @match        https://photos.google.com/*
 // @match        https://www.facebook.com/messages/*
 // @grant        GM_setValue
@@ -1067,7 +1067,8 @@
     btn.style.whiteSpace = 'nowrap';
     btn.disabled = true;
     btn.style.opacity = '0.55';
-    btn.title = 'Waiting for queued files from Google Photos';
+    btn.title =
+      'When files are queued from Google Photos: click to attach and send here. Disabled until a queue exists. Shift-click clears the queue.';
     btn.onclick = async (event) => {
       if (event && event.shiftKey) {
         const confirmClear = confirm('Clear the stored Google Photos → Messenger queue?');
@@ -1084,7 +1085,6 @@
       await processQueue();
       await updateMessengerButtonState();
     };
-    btn.title = 'Click to send queued files to Messenger. Shift-click to clear the queue.';
 
     const root = document.body || document.documentElement;
     root.appendChild(btn);
