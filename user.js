@@ -441,6 +441,14 @@
     return `${STORAGE_KEY}_chunk_${itemId}_${index}`;
   }
 
+  function hasExpectedMimeType(blob, mediaKind) {
+    const type = (blob && blob.type ? blob.type : '').toLowerCase();
+    if (!type) return false;
+    if (mediaKind === 'image') return type.startsWith('image/');
+    if (mediaKind === 'video') return type.startsWith('video/') || type.includes('stream');
+    return false;
+  }
+
   async function saveQueue(queue) {
     const metadata = [];
     for (const item of queue) {
@@ -552,9 +560,15 @@
           const videoResult = await fetchVideoBlob(item);
           blob = videoResult.blob;
           sourceUrl = videoResult.sourceUrl;
+          if (!blob || blob.size === 0 || !hasExpectedMimeType(blob, 'video')) {
+            throw new Error(`Expected video blob but got ${blob ? blob.type || 'unknown' : 'empty blob'}`);
+          }
         } else {
           // For images: fetch full resolution
           blob = await fetchBlob(getFullResUrl(item.thumbSrc));
+          if (!blob || blob.size === 0 || !hasExpectedMimeType(blob, 'image')) {
+            throw new Error(`Expected image blob but got ${blob ? blob.type || 'unknown' : 'empty blob'}`);
+          }
         }
 
         const ext  = blob.type.includes('video') ? 'mp4' : (blob.type.split('/')[1] || 'jpg');
@@ -743,123 +757,139 @@
   }
 
   async function processQueue() {
-    const queue = await loadQueue();
+    let queue;
+    try {
+      queue = await loadQueue();
+    } catch (err) {
+      warn('Failed to load queue from storage:', err);
+      alert(
+        '[GP→Messenger] The queued files could not be read (possibly corrupted storage).\n\n' +
+        'Try Shift-clicking the floating button to clear the queue, then queue the files again from Google Photos.'
+      );
+      return;
+    }
     if (!queue?.length) return;
 
     await clearQueue(); // clear immediately to avoid double-send
     log(`Processing ${queue.length} file(s).`);
 
-    // ── Wait for a chat's compose box to be present ────────────────────────
-    // Facebook Messenger uses a contenteditable div as the compose area.
-    // The aria-label varies by locale; we try several selectors.
-    const composeBox = await waitFor(
-      () =>
-        document.querySelector('[aria-label="Message"][contenteditable="true"]') ||
-        document.querySelector('[aria-label*="message" i][contenteditable="true"]') ||
-        document.querySelector('[contenteditable="true"][role="textbox"]') ||
-        document.querySelector('div[contenteditable="true"][data-lexical-editor]'),
-      15000
-    );
-
-    if (!composeBox) {
-      alert(
-        '[GP→Messenger] Could not find a Messenger chat compose box.\n\n' +
-        'Make sure you have a conversation open at facebook.com/messages/t/…\n\n' +
-        'Your files have been re-queued — navigate to a chat and wait a few seconds.'
+    try {
+      // ── Wait for a chat's compose box to be present ────────────────────────
+      // Facebook Messenger uses a contenteditable div as the compose area.
+      // The aria-label varies by locale; we try several selectors.
+      const composeBox = await waitFor(
+        () =>
+          document.querySelector('[aria-label="Message"][contenteditable="true"]') ||
+          document.querySelector('[aria-label*="message" i][contenteditable="true"]') ||
+          document.querySelector('[contenteditable="true"][role="textbox"]') ||
+          document.querySelector('div[contenteditable="true"][data-lexical-editor]'),
+        15000
       );
-      await saveQueue(queue);
-      return;
-    }
 
-    // ── Reconstruct File objects (inline base64 or delayed remote fetch) ───
-    const files = [];
-    for (const item of queue) {
-      if (item.transferMode === 'remoteFetch') {
-        showPanel(`Downloading large video for Messenger: ${item.filename}…`);
-        try {
-          const remoteBlob = await fetchBlob(item.sourceUrl);
-          if (!remoteBlob || remoteBlob.size === 0) {
-            throw new Error('Remote blob is empty');
-          }
-          files.push(new File([remoteBlob], item.filename, { type: item.mimeType || remoteBlob.type || 'video/mp4' }));
-        } catch (err) {
-          warn(`Failed delayed fetch for ${item.filename}:`, err);
-          alert(
-            '[GP→Messenger] Failed to re-download a large video before upload.\n\n' +
-            'Please try again from Google Photos and keep both tabs logged in.'
-          );
-          return;
-        } finally {
-          hidePanel();
-        }
-      } else {
-        const bin   = atob(item.dataUrl.split(',')[1]);
-        const bytes = new Uint8Array(bin.length);
-        for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
-        files.push(new File([bytes], item.filename, { type: item.mimeType }));
+      if (!composeBox) {
+        alert(
+          '[GP→Messenger] Could not find a Messenger chat compose box.\n\n' +
+          'Make sure you have a conversation open at facebook.com/messages/t/…\n\n' +
+          'Your files have been re-queued — navigate to a chat and wait a few seconds.'
+        );
+        await saveQueue(queue);
+        return;
       }
-    }
 
-    // ── Strategy 1: inject via Facebook's hidden file input ───────────────
-    // Facebook Messenger (on facebook.com) keeps a hidden <input type="file">
-    // tied to the attachment/image button. Setting its .files triggers the
-    // same upload pipeline as a manual attachment.
-    const fileInput = await waitFor(
-      () =>
-        // The image/attachment input is often scoped near the composer
-        composeBox.closest('form, [role="main"], [role="region"]')
-          ?.querySelector('input[type="file"]') ||
-        document.querySelector('input[type="file"][accept*="image"]') ||
-        document.querySelector('input[type="file"][accept*="video"]') ||
-        document.querySelector('input[type="file"]'),
-      6000
-    );
+      // ── Reconstruct File objects (inline base64 or delayed remote fetch) ───
+      const files = [];
+      for (const item of queue) {
+        if (item.transferMode === 'remoteFetch') {
+          showPanel(`Downloading large video for Messenger: ${item.filename}…`);
+          try {
+            const remoteBlob = await fetchBlob(item.sourceUrl);
+            if (!remoteBlob || remoteBlob.size === 0 || !hasExpectedMimeType(remoteBlob, 'video')) {
+              throw new Error(`Invalid delayed video blob type: ${remoteBlob ? remoteBlob.type || 'unknown' : 'empty blob'}`);
+            }
+            files.push(new File([remoteBlob], item.filename, { type: item.mimeType || remoteBlob.type || 'video/mp4' }));
+          } finally {
+            hidePanel();
+          }
+        } else {
+          const bin   = atob(item.dataUrl.split(',')[1]);
+          const bytes = new Uint8Array(bin.length);
+          for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+          files.push(new File([bytes], item.filename, { type: item.mimeType }));
+        }
+      }
 
-    if (fileInput) {
-      const dt = new DataTransfer();
-      files.forEach(f => dt.items.add(f));
-      fileInput.files = dt.files;
-      fileInput.dispatchEvent(new Event('change', { bubbles: true }));
-      log('Files injected via file input.');
-    } else {
-      // ── Strategy 2: paste via ClipboardEvent on the compose box ──────────
-      // Facebook's composer handles paste events with file data, which is
-      // how screenshot-paste works — we can replicate this.
-      log('File input not found — trying clipboard paste simulation.');
-      composeBox.focus();
-      await sleep(200);
-
-      const dt = new DataTransfer();
-      files.forEach(f => dt.items.add(f));
-
-      const pasteEvent = new ClipboardEvent('paste', {
-        bubbles: true,
-        cancelable: true,
-        clipboardData: dt,
-      });
-      composeBox.dispatchEvent(pasteEvent);
-      log('Paste event dispatched.');
-    }
-
-    // ── Wait for previews to render, then click Send ───────────────────────
-    await sleep(2500);
-
-    // Facebook's send button has a specific aria-label
-    const sendBtn =
-      document.querySelector('[aria-label="Send"][role="button"]') ||
-      document.querySelector('[aria-label*="Send" i][role="button"]') ||
-      document.querySelector('div[aria-label="Send"]');
-
-    if (sendBtn) {
-      sendBtn.click();
-      log('Sent via Send button.');
-    } else {
-      // Fallback: Enter key in the compose box
-      composeBox.focus();
-      composeBox.dispatchEvent(
-        new KeyboardEvent('keydown', { key: 'Enter', keyCode: 13, bubbles: true })
+      // ── Strategy 1: inject via Facebook's hidden file input ───────────────
+      // Facebook Messenger (on facebook.com) keeps a hidden <input type="file">
+      // tied to the attachment/image button. Setting its .files triggers the
+      // same upload pipeline as a manual attachment.
+      const fileInput = await waitFor(
+        () =>
+          // The image/attachment input is often scoped near the composer
+          composeBox.closest('form, [role="main"], [role="region"]')
+            ?.querySelector('input[type="file"]') ||
+          document.querySelector('input[type="file"][accept*="image"]') ||
+          document.querySelector('input[type="file"][accept*="video"]') ||
+          document.querySelector('input[type="file"]'),
+        6000
       );
-      log('Sent via Enter key fallback.');
+
+      if (fileInput) {
+        const dt = new DataTransfer();
+        files.forEach(f => dt.items.add(f));
+        fileInput.files = dt.files;
+        fileInput.dispatchEvent(new Event('change', { bubbles: true }));
+        log('Files injected via file input.');
+      } else {
+        // ── Strategy 2: paste via ClipboardEvent on the compose box ──────────
+        // Facebook's composer handles paste events with file data, which is
+        // how screenshot-paste works — we can replicate this.
+        log('File input not found — trying clipboard paste simulation.');
+        composeBox.focus();
+        await sleep(200);
+
+        const dt = new DataTransfer();
+        files.forEach(f => dt.items.add(f));
+
+        const pasteEvent = new ClipboardEvent('paste', {
+          bubbles: true,
+          cancelable: true,
+          clipboardData: dt,
+        });
+        composeBox.dispatchEvent(pasteEvent);
+        log('Paste event dispatched.');
+      }
+
+      // ── Wait for previews to render, then click Send ───────────────────────
+      await sleep(2500);
+
+      // Facebook's send button has a specific aria-label
+      const sendBtn =
+        document.querySelector('[aria-label="Send"][role="button"]') ||
+        document.querySelector('[aria-label*="Send" i][role="button"]') ||
+        document.querySelector('div[aria-label="Send"]');
+
+      if (sendBtn) {
+        sendBtn.click();
+        log('Sent via Send button.');
+      } else {
+        // Fallback: Enter key in the compose box
+        composeBox.focus();
+        composeBox.dispatchEvent(
+          new KeyboardEvent('keydown', { key: 'Enter', keyCode: 13, bubbles: true })
+        );
+        log('Sent via Enter key fallback.');
+      }
+    } catch (err) {
+      warn('Messenger send flow failed; restoring queue for retry:', err);
+      try {
+        await saveQueue(queue);
+      } catch (saveErr) {
+        warn('Failed to restore queue after send failure:', saveErr);
+      }
+      alert(
+        '[GP→Messenger] Sending failed, and your queue was restored.\n\n' +
+        'Open a Messenger chat and click the button again to retry.'
+      );
     }
   }
 
