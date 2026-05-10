@@ -1,8 +1,8 @@
 // ==UserScript==
-// @name         Google Photos → Facebook Messenger (Direct Upload)
+// @name         Google Photos → Facebook Messenger (Direct Upload) + Album
 // @namespace    https://github.com/you/gphoto-to-messenger
-// @version      1.3.0
-// @description  Select photos/videos in Google Photos and send them directly to a Messenger chat as file uploads (not album links).
+// @version      1.4.2
+// @description  Select photos/videos in Google Photos and send them directly to a Messenger chat as file uploads, AND add to a Google Photos album.
 // @updateURL    https://github.com/TomVarga/PhotosToMessengerUserscript/raw/refs/heads/main/user.js
 // @downloadURL  https://github.com/TomVarga/PhotosToMessengerUserscript/raw/refs/heads/main/user.js
 // @author       You
@@ -30,11 +30,14 @@
   'use strict';
 
   const STORAGE_KEY = 'gp2messenger_queue';
+  const ALBUM_NAME_KEY = 'gp2messenger_album_name';
   const BUTTON_ID   = 'gp2m-send-btn';
   const PANEL_ID    = 'gp2m-panel';
+  const INPUT_WRAPPER_ID = 'gp2m-input-wrapper';
+  const ALBUM_INPUT_ID = 'gp2m-album-input';
   const MAX_FILES   = 10;
   const POLL_MS     = 800;
-  const DATA_CHUNK_SIZE = 256 * 1024; // chunk large base64 values into 256KB pieces
+  const DATA_CHUNK_SIZE = 256 * 1024;
   const LARGE_VIDEO_THRESHOLD_BYTES = 30 * 1024 * 1024;
 
   const DEBUG = false;
@@ -45,19 +48,19 @@
 
   // ── Route to the right side ───────────────────────────────────────────────
   log(`Script loaded on ${location.hostname}${location.pathname}`);
-  
+
   if (location.hostname === 'www.facebook.com' && location.pathname.startsWith('/messages')) {
     log('Running on Facebook Messenger side');
     messengerSide();
     return;
   }
-  
+
   if (location.hostname === 'photos.google.com') {
-    log('Running on Google Photos side - using floating Messenger FAB');
+    log('Running on Google Photos side - using floating Messenger FAB + Album input');
     googlePhotosSide();
     return;
   }
-  
+
   warn(`Script running on unexpected domain: ${location.hostname}`);
 
   // ═══════════════════════════════════════════════════════════════════════════
@@ -65,12 +68,13 @@
   // ═══════════════════════════════════════════════════════════════════════════
   function googlePhotosSide() {
     injectStyles();
+    createAlbumInputWrapper();
     createFloatingButton();
     observeButtonRoot();
     let lastSelectedCount = 0;
 
-    // If Google Photos rerenders the page shell, keep recreating the FAB.
     setInterval(createFloatingButton, 3000);
+    setInterval(createAlbumInputWrapper, 3000);
 
     setInterval(() => {
       const selected = getSelectedItems();
@@ -103,6 +107,44 @@
     });
   }
 
+  // ── Album Input Field Functions ───────────────────────────────────────
+  function createAlbumInputWrapper() {
+    if (document.getElementById(INPUT_WRAPPER_ID)) return;
+
+    const wrapper = document.createElement('div');
+    wrapper.id = INPUT_WRAPPER_ID;
+
+    const input = document.createElement('input');
+    input.id = ALBUM_INPUT_ID;
+    input.type = 'text';
+    input.placeholder = 'Album name (optional)';
+    input.autocomplete = 'off';
+
+    // FIXED: GM_getValue is synchronous
+    const savedValue = GM_getValue(ALBUM_NAME_KEY, '');
+    if (savedValue) input.value = savedValue;
+
+    input.addEventListener('change', (e) => {
+      GM_setValue(ALBUM_NAME_KEY, e.target.value.trim());
+    });
+
+    input.addEventListener('blur', (e) => {
+      GM_setValue(ALBUM_NAME_KEY, e.target.value.trim());
+    });
+
+    wrapper.appendChild(input);
+
+    const root = document.body || document.documentElement;
+    root.appendChild(wrapper);
+    log('Album input wrapper injected');
+  }
+
+  function getAlbumName() {
+    const input = document.getElementById(ALBUM_INPUT_ID);
+    return input ? input.value.trim() : '';
+  }
+
+  // ── FAB creation positioned below input ──────────────────────────
   function createFloatingButton() {
     if (document.getElementById(BUTTON_ID)) return;
     const btn = document.createElement('button');
@@ -113,7 +155,7 @@
     btn.style.display = 'inline-flex';
     btn.style.position = 'fixed';
     btn.style.right = '24px';
-    btn.style.bottom = '24px';
+    btn.style.bottom = '84px';
     btn.style.zIndex = '2147483647';
     btn.style.opacity = '0.65';
     btn.style.cursor = 'pointer';
@@ -144,15 +186,20 @@
         log('Floating action button removed, recreating');
         createFloatingButton();
       }
+      if (!document.getElementById(INPUT_WRAPPER_ID)) {
+        log('Album input wrapper removed, recreating');
+        createAlbumInputWrapper();
+      }
     });
     observer.observe(root, { childList: true, subtree: true });
   }
 
+  // ── Item selection logic ────────────────────────────────────────
   function getSelectedItems() {
     const items = [];
     const seen = new Set();
 
-    const normalizeUrl = url => url && url.replace(/\\?authuser=\d+/, '');
+    const normalizeUrl = url => url && url.replace(/\?authuser=\d+/, '');
     const extractBackgroundImage = el => {
       if (!el) return null;
       const style = el.getAttribute('style') || el.style.backgroundImage || '';
@@ -213,7 +260,6 @@
 
     const findItemRoot = el => el.closest('a.p137Zd, div.rtIMgb, div[data-photo-id], div[data-video-id], div[role="checkbox"]');
 
-    // Method 1: selected checkboxes in the photo grid
     const selectedBoxes = Array.from(document.querySelectorAll('[role="checkbox"][aria-checked="true"]'));
     dlog(`Method 1: Found ${selectedBoxes.length} selected checkboxes`);
     selectedBoxes.forEach(box => {
@@ -221,7 +267,6 @@
       addItem(itemRoot || box);
     });
 
-    // Method 2: aria-selected on tabs and items
     if (!items.length) {
       const selectedEls = Array.from(document.querySelectorAll('[aria-selected="true"]'));
       dlog(`Method 2: Found ${selectedEls.length} aria-selected=true elements`);
@@ -231,14 +276,12 @@
       });
     }
 
-    // Method 3: data-selected attributes
     if (!items.length) {
       const dataSelectedEls = Array.from(document.querySelectorAll('[data-selected="true"]'));
       dlog(`Method 3: Found ${dataSelectedEls.length} data-selected=true elements`);
       dataSelectedEls.forEach(el => addItem(findItemRoot(el) || el));
     }
 
-    // Method 4: checked inputs (rare in this UI)
     if (!items.length) {
       const checkedInputs = Array.from(document.querySelectorAll('input[type="checkbox"]:checked'));
       dlog(`Method 4: Found ${checkedInputs.length} checked input elements`);
@@ -249,7 +292,6 @@
     return items;
   }
 
-  // lh3.googleusercontent.com URLs end with =wNNN-hNNN; swap for =d (download)
   function getFullResUrl(src) {
     if (!src) return src;
     try {
@@ -280,19 +322,13 @@
     return Array.from(urls);
   }
 
-
   async function fetchVideoBlob(item) {
     log(`Fetching video for item: ${item.detailHref}`);
-    
-    // Strategy 1: Try to extract video URLs from detail page directly
     if (item.detailHref) {
       try {
         const html = await fetchDetailPageHtml(item.detailHref);
-        
-        // Look for video URLs in all forms
         const videoUrls = findAllVideoUrlsInPage(html);
         log(`Found ${videoUrls.length} potential video URLs in detail page`);
-        
         for (const url of videoUrls) {
           try {
             const blob = await fetchBlob(url);
@@ -308,14 +344,11 @@
         warn('Could not process detail page:', err);
       }
     }
-
     throw new Error('Could not obtain video file. Try downloading manually with Shift+D and saving to a known location.');
   }
 
   function findAllVideoUrlsInPage(html) {
     const urls = new Set();
-    
-    // Pattern 1: Direct googlevideo.com URLs
     const googleVideoPattern = /https:\/\/[^"'\s]+googlevideo\.com[^"'\s]*/g;
     const googleVideoMatches = html.match(googleVideoPattern);
     if (googleVideoMatches) {
@@ -324,8 +357,6 @@
         if (clean.length > 20) urls.add(clean);
       });
     }
-
-    // Pattern 2: JSON-embedded URLs with "url" keys
     const jsonUrlPattern = /"url":"(https:\/\/[^"]+)"/g;
     let match;
     while ((match = jsonUrlPattern.exec(html)) !== null) {
@@ -334,25 +365,19 @@
         urls.add(url);
       }
     }
-
-    // Pattern 3: m.c values (Google's media cache pattern)
     const mediaCachePattern = /https:\/\/[^"'\s]*(?:lh3\.googleusercontent|photos\.fife)[^"'\s]*=/g;
     const mediaCacheMatches = html.match(mediaCachePattern);
     if (mediaCacheMatches) {
       mediaCacheMatches.forEach(baseUrl => {
-        // Try video-specific parameter variants
         ['=dv', '=dv-rw', '=dv-no', '=d', '=d-rw'].forEach(param => {
           urls.add(baseUrl.replace(/=[^&"'\s]*$/, param));
         });
       });
     }
-
-    // Pattern 4: Look for blob URLs or data URLs (less likely to work but worth trying)
-    const srcPattern = /src="([^"]*(?:blob:|data:video)[^"]*)"/g;
+    const srcPattern = /src="([^"]*(?:blob:|video)[^"]*)"/g;
     while ((match = srcPattern.exec(html)) !== null) {
       urls.add(match[1]);
     }
-
     log(`Pattern matching found ${urls.size} candidate URLs`);
     return Array.from(urls).filter(url => url && url.length > 15);
   }
@@ -377,7 +402,6 @@
         warn(`fetchBlob ${fn.name} failed:`, err && err.message ? err.message : err);
       }
     }
-
     throw lastError || new Error('Failed to fetch blob');
   }
 
@@ -451,6 +475,7 @@
     return false;
   }
 
+  // FIXED: Removed async/await from GM storage functions (they are synchronous)
   async function saveQueue(queue) {
     const metadata = [];
     for (const item of queue) {
@@ -466,7 +491,7 @@
         const itemId = `item_${Date.now()}_${Math.random().toString(36).slice(2, 10)}`;
         const chunks = chunkString(item.dataUrl, DATA_CHUNK_SIZE);
         for (let index = 0; index < chunks.length; index++) {
-          await GM_setValue(generateChunkKey(itemId, index), chunks[index]);
+          GM_setValue(generateChunkKey(itemId, index), chunks[index]);
         }
         metadata.push({
           transferMode: 'inlineDataUrl',
@@ -477,12 +502,13 @@
         });
       }
     }
-    await GM_setValue(STORAGE_KEY, JSON.stringify(metadata));
+    GM_setValue(STORAGE_KEY, JSON.stringify(metadata));
     return metadata;
   }
 
-  async function getQueueMetadata() {
-    const raw = await GM_getValue(STORAGE_KEY, null);
+  // FIXED: Made synchronous
+  function getQueueMetadata() {
+    const raw = GM_getValue(STORAGE_KEY, null);
     if (!raw) return null;
     try {
       return JSON.parse(raw);
@@ -492,7 +518,7 @@
   }
 
   async function loadQueue() {
-    const metadata = await getQueueMetadata();
+    const metadata = getQueueMetadata();
     if (!metadata?.length) return null;
     const queue = [];
     for (const item of metadata) {
@@ -508,7 +534,7 @@
       }
       let dataUrl = '';
       for (let index = 0; index < item.chunkCount; index++) {
-        const chunk = await GM_getValue(generateChunkKey(item.id, index), null);
+        const chunk = GM_getValue(generateChunkKey(item.id, index), null);
         if (chunk === null) throw new Error(`Missing queue chunk ${index} for ${item.id}`);
         dataUrl += chunk;
       }
@@ -518,18 +544,300 @@
   }
 
   async function clearQueue() {
-    const metadata = await getQueueMetadata();
+    const metadata = getQueueMetadata();
     if (metadata?.length) {
       for (const item of metadata) {
         if (!item.id || !item.chunkCount) continue;
         for (let index = 0; index < item.chunkCount; index++) {
-          await GM_deleteValue(generateChunkKey(item.id, index));
+          GM_deleteValue(generateChunkKey(item.id, index));
         }
       }
     }
-    await GM_setValue(STORAGE_KEY, null);
+    GM_setValue(STORAGE_KEY, null);
   }
 
+  // ── Add selected items to a Google Photos album (DOM automation) ───────────
+  function gpNorm(s) {
+    return (s || '').replace(/\s+/g, ' ').trim().toLowerCase();
+  }
+
+  function gpIsVisible(el) {
+    if (!el || !(el instanceof Element)) return false;
+    const r = el.getBoundingClientRect();
+    if (r.width < 2 || r.height < 2) return false;
+    const st = getComputedStyle(el);
+    if (st.visibility === 'hidden' || st.display === 'none' || Number(st.opacity) === 0) return false;
+    return true;
+  }
+
+  function gpFindDialogRoot() {
+    return (
+      document.querySelector('[role="dialog"][aria-modal="true"]') ||
+      document.querySelector('[role="dialog"]') ||
+      document.querySelector('[aria-modal="true"]')
+    );
+  }
+
+  function gpGetAlbumPickerScope() {
+    return gpFindDialogRoot() || document;
+  }
+
+  function gpSetReactInputValue(input, value) {
+    if (!input) return;
+    const proto = input instanceof HTMLTextAreaElement ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
+    const desc = Object.getOwnPropertyDescriptor(proto, 'value');
+    if (desc && desc.set) desc.set.call(input, value);
+    else input.value = value;
+    input.dispatchEvent(new InputEvent('input', { bubbles: true, data: value, inputType: 'insertReplacementText' }));
+    input.dispatchEvent(new Event('change', { bubbles: true }));
+  }
+
+  function gpActivateElement(el) {
+    if (!el) return false;
+    const target =
+      el.closest('[role="option"], [role="menuitem"], li, button, [role="button"]') ||
+      el;
+    try {
+      target.scrollIntoView({ block: 'nearest', inline: 'nearest' });
+    } catch {}
+    try {
+      target.focus({ preventScroll: true });
+    } catch {}
+    if (typeof PointerEvent !== 'undefined') {
+      target.dispatchEvent(new PointerEvent('pointerdown', { bubbles: true, cancelable: true, pointerType: 'mouse', button: 0 }));
+      target.dispatchEvent(new PointerEvent('pointerup', { bubbles: true, cancelable: true, pointerType: 'mouse', button: 0 }));
+    }
+    target.dispatchEvent(new MouseEvent('mousedown', { bubbles: true, cancelable: true, button: 0 }));
+    target.dispatchEvent(new MouseEvent('mouseup', { bubbles: true, cancelable: true, button: 0 }));
+    target.click();
+    target.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', code: 'Enter', keyCode: 13, which: 13, bubbles: true }));
+    target.dispatchEvent(new KeyboardEvent('keyup', { key: 'Enter', code: 'Enter', keyCode: 13, which: 13, bubbles: true }));
+    return true;
+  }
+
+  async function gpConfirmAlbumSelection(timeoutMs = 1800) {
+    const confirmBtn = await waitFor(
+      () => {
+        const scope = gpGetAlbumPickerScope();
+        return (
+          gpFindClickableByPhrases(scope, ['done', 'add', 'save'], { exclude: ['create'] }) ||
+          gpFindClickableByPhrases(scope, ['done', 'add to album', 'save'])
+        );
+      },
+      timeoutMs
+    );
+    if (confirmBtn) {
+      gpActivateElement(confirmBtn);
+      await sleep(450);
+    }
+  }
+
+  function gpCollectClickables(root) {
+    if (!root) return [];
+    return Array.from(
+      root.querySelectorAll(
+        'button, [role="button"], [role="menuitem"], [role="option"], [role="listitem"], a[href="#"], a[role="button"]'
+      )
+    ).filter(gpIsVisible);
+  }
+
+  function gpFindClickableByPhrases(root, phrases, { exclude = [] } = {}) {
+    const need = phrases.map(gpNorm);
+    const skip = exclude.map(gpNorm);
+    for (const el of gpCollectClickables(root)) {
+      const t = gpNorm(el.textContent);
+      if (skip.some(s => s && t.includes(s))) continue;
+      if (need.some(p => p && t.includes(p))) return el;
+    }
+    return null;
+  }
+
+  /** Prefer "Album" over "Shared album" etc. */
+  function gpFindAlbumMenuEntry(root = document) {
+    const items = Array.from(
+      root.querySelectorAll('[role="menuitem"], [role="menuitemradio"], [role="option"], [role="listitem"]')
+    ).filter(gpIsVisible);
+    const scored = items
+      .map(el => {
+        const t = gpNorm(el.textContent);
+        const a = gpNorm(el.getAttribute('aria-label') || '');
+        const label = t || a;
+        let score = 0;
+        if (label === 'album') score = 100;
+        else if (label.includes('add to album') && !label.includes('shared')) score = 85;
+        else if (label.includes('album') && !label.includes('shared')) score = 60;
+        else if (label.includes('album')) score = 25;
+        return { el, score };
+      })
+      .filter(x => x.score > 0)
+      .sort((a, b) => b.score - a.score);
+    return scored[0]?.el || null;
+  }
+
+  function gpFindAddToControl() {
+    const candidates = Array.from(document.querySelectorAll('button, div[role="button"], span[role="button"]'));
+    const scored = candidates
+      .map(el => {
+        const t = gpNorm(el.textContent);
+        const a = gpNorm(el.getAttribute('aria-label') || '');
+        const title = gpNorm(el.getAttribute('title') || '');
+        let score = 0;
+        if (a.includes('add to') || title.includes('add to')) score += 12;
+        if (t === 'add to') score += 22;
+        if (t.includes('add to album')) score += 18;
+        if (t.includes('add to') && t.length < 24) score += 6;
+        return { el, score };
+      })
+      .filter(x => x.score > 0)
+      .sort((a, b) => b.score - a.score);
+    return scored[0]?.el || null;
+  }
+
+  function gpFindRowMatchingAlbum(root, name) {
+    const want = gpNorm(name);
+    if (!want) return null;
+    const rows = Array.from(
+      root.querySelectorAll('[role="option"], [role="menuitem"], [role="listitem"], li, button, [role="button"]')
+    ).filter(gpIsVisible);
+    const isCreateLike = text =>
+      text.includes('create album') ||
+      text.includes('new album') ||
+      text.includes('create new album') ||
+      text.startsWith('create "') ||
+      text.startsWith('create ');
+    const startsWithAlbumName = label => {
+      if (!label) return false;
+      if (label === want) return true;
+      if (label.startsWith(want + ' ')) return true;
+      if (label.startsWith(want + '·') || label.startsWith(want + ' ·')) return true;
+      if (label.startsWith(want + ',')) return true;
+      return false;
+    };
+    const isMatch = el => {
+      const textLabel = gpNorm(el.textContent);
+      const ariaLabel = gpNorm(el.getAttribute('aria-label') || '');
+      const combined = `${textLabel} ${ariaLabel}`.trim();
+      if (!combined || isCreateLike(combined)) return false;
+      if (startsWithAlbumName(ariaLabel)) return true;
+      if (startsWithAlbumName(textLabel)) return true;
+      // Some variants render name in a nested span only.
+      const nameNode = el.querySelector('[jsname="K4r5Ff"], .aqdrmf-rymPhb-fpDzbe-fmcmS');
+      const nestedName = gpNorm(nameNode?.textContent || '');
+      if (nestedName === want) return true;
+      return false;
+    };
+    return rows.find(isMatch) || null;
+  }
+
+  async function addToGooglePhotosAlbum(albumName, selectedItems) {
+    if (!albumName) return { success: true, message: 'No album name provided, skipping album creation' };
+
+    showPanel(`Adding ${selectedItems.length} item(s) to album "${albumName}"...`);
+
+    try {
+      const addToButton = gpFindAddToControl();
+      if (!addToButton) {
+        warn('Could not automatically add to album - UI may have changed');
+        hidePanel();
+        return {
+          success: false,
+          message: `Album feature: Please manually add selected items to "${albumName}". The automated flow may need updating due to Google Photos UI changes.`,
+        };
+      }
+
+      addToButton.click();
+      await sleep(250);
+
+      let dialog = await waitFor(gpFindDialogRoot, 1200);
+
+      if (!dialog) {
+        const albumEntry = await waitFor(() => gpFindAlbumMenuEntry(document), 1200);
+        if (albumEntry) {
+          gpActivateElement(albumEntry);
+          await sleep(250);
+        }
+        dialog = await waitFor(gpFindDialogRoot, 1200);
+      }
+
+      const root = dialog || document;
+
+      let existing = gpFindRowMatchingAlbum(gpGetAlbumPickerScope(), albumName);
+      if (existing) {
+        gpActivateElement(existing);
+        await gpConfirmAlbumSelection();
+        await sleep(450);
+        hidePanel();
+        return { success: true, message: `Items added to existing album "${albumName}"` };
+      }
+
+      const searchLike = root.querySelector(
+        'input[type="search"], input[placeholder*="search" i], input[aria-label*="search" i]'
+      );
+      if (searchLike && !gpNorm(searchLike.placeholder).includes('title')) {
+        gpSetReactInputValue(searchLike, albumName);
+        existing = await waitFor(() => gpFindRowMatchingAlbum(gpGetAlbumPickerScope(), albumName), 1600);
+        if (existing) {
+          gpActivateElement(existing);
+          await gpConfirmAlbumSelection();
+          await sleep(450);
+          hidePanel();
+          return { success: true, message: `Items added to existing album "${albumName}"` };
+        }
+        warn(`Album "${albumName}" not found in search results; skipping auto-create to avoid duplicate album`);
+        hidePanel();
+        return {
+          success: false,
+          message: `Album "${albumName}" was not matched in the picker results. Please select it manually to avoid creating a duplicate.`,
+        };
+      }
+
+      const newAlbumBtn = gpFindClickableByPhrases(root, ['new album', 'create album', 'create new album']);
+      if (newAlbumBtn) {
+        newAlbumBtn.click();
+        await sleep(700);
+      }
+
+      const dialog2 = gpFindDialogRoot() || root;
+      const albumInput = await waitFor(
+        () =>
+          dialog2.querySelector('input[placeholder*="album" i]') ||
+          dialog2.querySelector('input[placeholder*="title" i]') ||
+          dialog2.querySelector('input[aria-label*="album" i]') ||
+          dialog2.querySelector('input[aria-label*="title" i]') ||
+          Array.from(dialog2.querySelectorAll('input[type="text"], input:not([type])')).find(
+            inp => gpIsVisible(inp) && !inp.readOnly && !inp.disabled
+          ),
+        4500
+      );
+
+      if (albumInput) {
+        albumInput.focus();
+        gpSetReactInputValue(albumInput, albumName);
+        await sleep(450);
+
+        const createBtn = gpFindClickableByPhrases(dialog2, ['create', 'done', 'add', 'save']);
+        if (createBtn) {
+          createBtn.click();
+          await sleep(1200);
+          hidePanel();
+          return { success: true, message: `Items added to album "${albumName}"` };
+        }
+      }
+
+      warn('Could not automatically add to album - UI may have changed');
+      hidePanel();
+      return {
+        success: false,
+        message: `Album feature: Please manually add selected items to "${albumName}". The automated flow may need updating due to Google Photos UI changes.`,
+      };
+    } catch (err) {
+      warn('Error adding to album:', err);
+      hidePanel();
+      return { success: false, message: `Failed to add to album: ${err.message}` };
+    }
+  }
+
+  // ── Modified onSendClick to include album functionality ────────────────────
   async function onSendClick(event) {
     if (event && event.shiftKey) {
       const confirmClear = confirm('Clear the stored Google Photos → Messenger queue?');
@@ -546,10 +854,11 @@
     if (selected.length > MAX_FILES)
       return alert(`Please select at most ${MAX_FILES} items at a time.`);
 
+    const albumName = getAlbumName();
+
     showPanel('Fetching selected media…');
     const queue = [];
 
-    // Iterate through each selected item one-by-one
     for (let i = 0; i < selected.length; i++) {
       updatePanel(`Downloading ${i + 1} / ${selected.length}…`);
       try {
@@ -558,7 +867,6 @@
         let sourceUrl = null;
 
         if (item.type === 'video') {
-          // For videos: fetch via detail page URL extraction
           const videoResult = await fetchVideoBlob(item);
           blob = videoResult.blob;
           sourceUrl = videoResult.sourceUrl;
@@ -566,7 +874,6 @@
             throw new Error(`Expected video blob but got ${blob ? blob.type || 'unknown' : 'empty blob'}`);
           }
         } else {
-          // For images: fetch full resolution
           blob = await fetchBlob(getFullResUrl(item.thumbSrc));
           if (!blob || blob.size === 0 || !hasExpectedMimeType(blob, 'image')) {
             throw new Error(`Expected image blob but got ${blob ? blob.type || 'unknown' : 'empty blob'}`);
@@ -602,9 +909,24 @@
       }
     }
 
-    if (!queue.length) { 
-      hidePanel(); 
-      return alert('Could not download any selected items.'); 
+    if (!queue.length) {
+      hidePanel();
+      return alert('Could not download any selected items.');
+    }
+
+    // ── Add to Google Photos Album (before opening Messenger) ───────────
+    if (albumName) {
+      try {
+        const albumResult = await addToGooglePhotosAlbum(albumName, selected);
+        if (!albumResult.success) {
+          console.warn('[GP→Messenger] Album warning:', albumResult.message);
+          updatePanel(`⚠️ ${albumResult.message}`);
+          await sleep(1500);
+        }
+      } catch (albumErr) {
+        warn('Album operation failed:', albumErr);
+        // Continue with Messenger flow even if album fails
+      }
     }
 
     const largeVideoCount = queue.filter(item => item.transferMode === 'remoteFetch').length;
@@ -617,7 +939,6 @@
     await sleep(400);
     hidePanel();
 
-    // Open Facebook Messages — if a specific chat was last open it will resume
     GM_openInTab('https://www.facebook.com/messages/', { active: true, insert: true });
   }
 
@@ -637,7 +958,7 @@
         background: #1877f2;
         border: none;
         border-radius: 28px;
-        bottom: 24px;
+        bottom: 84px;
         color: white;
         cursor: pointer;
         display: inline-flex;
@@ -657,6 +978,36 @@
       }
       #${BUTTON_ID}:active {
         background: #0a50be;
+      }
+      #${INPUT_WRAPPER_ID} {
+        position: fixed;
+        right: 24px;
+        bottom: 24px;
+        z-index: 2147483647;
+        display: flex;
+        align-items: center;
+      }
+      #${ALBUM_INPUT_ID} {
+        padding: 10px 14px;
+        border: 1px solid rgba(255, 255, 255, 0.2);
+        border-radius: 24px;
+        font-size: 13px;
+        font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+        background: #202124;
+        color: #e8eaed;
+        caret-color: #e8eaed;
+        box-shadow: 0 4px 12px rgba(0, 0, 0, 0.28);
+        min-width: 180px;
+        max-width: 250px;
+        outline: none;
+        transition: box-shadow 0.2s, border-color 0.2s;
+      }
+      #${ALBUM_INPUT_ID}:focus {
+        border-color: rgba(24, 119, 242, 0.9);
+        box-shadow: 0 4px 20px rgba(24, 119, 242, 0.3);
+      }
+      #${ALBUM_INPUT_ID}::placeholder {
+        color: #9aa0a6;
       }
       #${PANEL_ID} {
         align-items: center;
@@ -681,13 +1032,11 @@
   }
 
   // ═══════════════════════════════════════════════════════════════════════════
-  // MESSENGER SIDE  (facebook.com/messages/*)
+  // MESSENGER SIDE
   // ═══════════════════════════════════════════════════════════════════════════
   async function messengerSide() {
     injectStyles();
     createMessengerButton();
-
-    // Facebook's SPA takes a while to hydrate before we can access the compose box.
     await sleep(4000);
     await updateMessengerButtonState();
     setInterval(updateMessengerButtonState, 2500);
@@ -746,7 +1095,7 @@
     const btn = document.getElementById(BUTTON_ID);
     if (!btn) return;
 
-    const meta = await getQueueMetadata();
+    const meta = getQueueMetadata();
     if (meta?.length) {
       btn.textContent = meta.length > 1 ? `📤 Send ${meta.length} files to chat` : '📤 Send 1 file to chat';
       btn.disabled = false;
@@ -772,13 +1121,10 @@
     }
     if (!queue?.length) return;
 
-    await clearQueue(); // clear immediately to avoid double-send
+    await clearQueue();
     log(`Processing ${queue.length} file(s).`);
 
     try {
-      // ── Wait for a chat's compose box to be present ────────────────────────
-      // Facebook Messenger uses a contenteditable div as the compose area.
-      // The aria-label varies by locale; we try several selectors.
       const composeBox = await waitFor(
         () =>
           document.querySelector('[aria-label="Message"][contenteditable="true"]') ||
@@ -798,7 +1144,6 @@
         return;
       }
 
-      // ── Reconstruct File objects (inline base64 or delayed remote fetch) ───
       const files = [];
       for (const item of queue) {
         if (item.transferMode === 'remoteFetch') {
@@ -820,13 +1165,8 @@
         }
       }
 
-      // ── Strategy 1: inject via Facebook's hidden file input ───────────────
-      // Facebook Messenger (on facebook.com) keeps a hidden <input type="file">
-      // tied to the attachment/image button. Setting its .files triggers the
-      // same upload pipeline as a manual attachment.
       const fileInput = await waitFor(
         () =>
-          // The image/attachment input is often scoped near the composer
           composeBox.closest('form, [role="main"], [role="region"]')
             ?.querySelector('input[type="file"]') ||
           document.querySelector('input[type="file"][accept*="image"]') ||
@@ -842,9 +1182,6 @@
         fileInput.dispatchEvent(new Event('change', { bubbles: true }));
         log('Files injected via file input.');
       } else {
-        // ── Strategy 2: paste via ClipboardEvent on the compose box ──────────
-        // Facebook's composer handles paste events with file data, which is
-        // how screenshot-paste works — we can replicate this.
         log('File input not found — trying clipboard paste simulation.');
         composeBox.focus();
         await sleep(200);
@@ -861,10 +1198,8 @@
         log('Paste event dispatched.');
       }
 
-      // ── Wait for previews to render, then click Send ───────────────────────
       await sleep(2500);
 
-      // Facebook's send button has a specific aria-label
       const sendBtn =
         document.querySelector('[aria-label="Send"][role="button"]') ||
         document.querySelector('[aria-label*="Send" i][role="button"]') ||
@@ -874,7 +1209,6 @@
         sendBtn.click();
         log('Sent via Send button.');
       } else {
-        // Fallback: Enter key in the compose box
         composeBox.focus();
         composeBox.dispatchEvent(
           new KeyboardEvent('keydown', { key: 'Enter', keyCode: 13, bubbles: true })
@@ -904,6 +1238,5 @@
       }, 300);
     });
   }
-
 
 })();
