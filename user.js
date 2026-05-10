@@ -3,6 +3,8 @@
 // @namespace    https://github.com/you/gphoto-to-messenger
 // @version      1.3.0
 // @description  Select photos/videos in Google Photos and send them directly to a Messenger chat as file uploads (not album links).
+// @updateURL    https://github.com/TomVarga/PhotosToMessengerUserscript/raw/refs/heads/main/user.js
+// @downloadURL  https://github.com/TomVarga/PhotosToMessengerUserscript/raw/refs/heads/main/user.js
 // @author       You
 // @match        https://photos.google.com/*
 // @match        https://www.facebook.com/messages/*
