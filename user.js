@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Google Photos → Facebook Messenger (Direct Upload) + Album
 // @namespace    https://github.com/TomVarga/PhotosToMessengerUserscript
-// @version      1.4.4
+// @version      1.4.5
 // @description  Select photos/videos in Google Photos and send them directly to a Messenger chat as file uploads, AND add to a Google Photos album.
 // @updateURL    https://github.com/TomVarga/PhotosToMessengerUserscript/raw/refs/heads/main/user.js
 // @downloadURL  https://github.com/TomVarga/PhotosToMessengerUserscript/raw/refs/heads/main/user.js
@@ -678,17 +678,23 @@
   }
 
   function gpFindAddToControl() {
-    const candidates = Array.from(document.querySelectorAll('button, div[role="button"], span[role="button"]'));
+    const candidates = Array.from(
+      document.querySelectorAll('button, div[role="button"], span[role="button"], [aria-haspopup="menu"]')
+    ).filter(gpIsVisible);
     const scored = candidates
       .map(el => {
         const t = gpNorm(el.textContent);
         const a = gpNorm(el.getAttribute('aria-label') || '');
         const title = gpNorm(el.getAttribute('title') || '');
         let score = 0;
-        if (a.includes('add to') || title.includes('add to')) score += 12;
+        if (a === 'add to album') score += 100;
+        else if (a.includes('add to album')) score += 70;
+        else if (a.includes('add to') || title.includes('add to')) score += 12;
+        if (title === 'add to album') score += 60;
         if (t === 'add to') score += 22;
         if (t.includes('add to album')) score += 18;
         if (t.includes('add to') && t.length < 24) score += 6;
+        if (a.includes('shared album') || title.includes('shared album') || t.includes('shared album')) score -= 40;
         return { el, score };
       })
       .filter(x => x.score > 0)
@@ -748,7 +754,7 @@
         };
       }
 
-      addToButton.click();
+      gpActivateElement(addToButton);
       await sleep(250);
 
       let dialog = await waitFor(gpFindDialogRoot, 1200);
