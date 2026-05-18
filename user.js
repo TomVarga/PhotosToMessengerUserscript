@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Google Photos → Facebook Messenger (Direct Upload) + Album
 // @namespace    https://github.com/TomVarga/PhotosToMessengerUserscript
-// @version      1.4.5
+// @version      1.5.9
 // @description  Select photos/videos in Google Photos and send them directly to a Messenger chat as file uploads, AND add to a Google Photos album.
 // @updateURL    https://github.com/TomVarga/PhotosToMessengerUserscript/raw/refs/heads/main/user.js
 // @downloadURL  https://github.com/TomVarga/PhotosToMessengerUserscript/raw/refs/heads/main/user.js
@@ -13,7 +13,6 @@
 // @grant        GM_deleteValue
 // @grant        GM_xmlhttpRequest
 // @grant        GM_openInTab
-// @grant        unsafeWindow
 // @connect      *
 // @connect      lh3.googleusercontent.com
 // @connect      *.googleusercontent.com
@@ -39,6 +38,13 @@
   const POLL_MS     = 800;
   const DATA_CHUNK_SIZE = 256 * 1024;
   const LARGE_VIDEO_THRESHOLD_BYTES = 30 * 1024 * 1024;
+  const GROUP_VIDEO_MAX_BYTES = 25 * 1024 * 1024;
+  const MIN_VIDEO_PX = 720;
+  const PREFERRED_1080_PX = 1080;
+  const PREFERRED_1080_KBPS = 4000;
+  const PREFERRED_720_KBPS = 3000;
+  const MIN_VIDEO_KBPS = 400;
+  const VIDEO_KBPS_STEP = 250;
 
   const DEBUG = false;
   const log  = (...a) => console.log('[GP→Messenger]', ...a);
@@ -557,6 +563,256 @@
   async function clearQueue() {
     deleteInlineChunksFromMetadata(getQueueMetadata());
     GM_setValue(STORAGE_KEY, null);
+  }
+
+  function isGroupMessengerChat() {
+    const memberLabel = document.querySelector(
+      '[aria-label*=" members" i], [aria-label*=" member," i], [aria-label^="members," i]'
+    );
+    if (memberLabel) return true;
+
+    const main = document.querySelector('[role="main"]');
+    if (main) {
+      const header = main.querySelector('header, [role="banner"], h1, h2');
+      const headerText = (header?.innerText || main.innerText || '').slice(0, 4000);
+      if (/\b\d+\s+members\b/i.test(headerText)) return true;
+    }
+
+    const groupChatLabel = document.querySelector(
+      '[aria-label*="group chat" i], [aria-label*="Group chat" i]'
+    );
+    return Boolean(groupChatLabel);
+  }
+
+  function extensionForMimeType(mimeType) {
+    const base = (mimeType || '').split(';')[0].toLowerCase();
+    if (base.includes('mp4')) return 'mp4';
+    if (base.includes('webm')) return 'webm';
+    return 'mp4';
+  }
+
+  function filenameWithExtension(filename, mimeType) {
+    const ext = extensionForMimeType(mimeType);
+    const base = (filename || 'video').replace(/\.[^.]+$/, '');
+    return `${base}.${ext}`;
+  }
+
+  function dimensionsForShortSide(srcW, srcH, targetShort) {
+    const short = Math.min(srcW, srcH);
+    const scale = targetShort / short;
+    let w = Math.round(srcW * scale);
+    let h = Math.round(srcH * scale);
+    const minSide = Math.min(w, h);
+    const floor = Math.min(MIN_VIDEO_PX, Math.min(srcW, srcH));
+    if (minSide < floor) {
+      const fix = floor / minSide;
+      w = Math.round(w * fix);
+      h = Math.round(h * fix);
+    }
+    return { width: w - (w % 2), height: h - (h % 2) };
+  }
+
+  function buildGroupVideoEncodeAttempts(srcW, srcH, duration) {
+    const srcShort = Math.min(srcW, srcH);
+    const theoreticalMaxKbps = Math.max(
+      MIN_VIDEO_KBPS,
+      Math.floor(((GROUP_VIDEO_MAX_BYTES * 8 * 0.88) / duration - 128_000) / 1000)
+    );
+    const attempts = [];
+    const seen = new Set();
+
+    const add = (shortSide, kbps, label) => {
+      const cappedKbps = Math.min(kbps, theoreticalMaxKbps);
+      if (cappedKbps < MIN_VIDEO_KBPS) return;
+      const targetShort = Math.min(shortSide, srcShort);
+      const key = `${targetShort}:${cappedKbps}`;
+      if (seen.has(key)) return;
+      seen.add(key);
+      attempts.push({ shortSide: targetShort, kbps: cappedKbps, label });
+    };
+
+    if (srcShort >= PREFERRED_1080_PX) {
+      add(PREFERRED_1080_PX, PREFERRED_1080_KBPS, '1080p');
+    }
+
+    const floor720 = Math.min(MIN_VIDEO_PX, srcShort);
+    add(floor720, PREFERRED_720_KBPS, '720p');
+
+    let kbps = PREFERRED_720_KBPS - VIDEO_KBPS_STEP;
+    while (kbps >= MIN_VIDEO_KBPS) {
+      add(floor720, kbps, '720p');
+      kbps -= VIDEO_KBPS_STEP;
+    }
+
+    return attempts;
+  }
+
+  async function tryGroupVideoEncodePlans(srcW, srcH, duration, encodeFn, onProgress, encoderLabel) {
+    const attempts = buildGroupVideoEncodeAttempts(srcW, srcH, duration);
+    if (!attempts.length) {
+      throw new Error('Could not build a valid encoding plan for this video');
+    }
+
+    for (const plan of attempts) {
+      const { width, height } = dimensionsForShortSide(srcW, srcH, plan.shortSide);
+      const prefix = encoderLabel ? `${encoderLabel}, ` : '';
+      onProgress?.(
+        `${prefix}${plan.label} ${width}×${height} @ ${plan.kbps} kbps…`
+      );
+      const encoded = await encodeFn(width, height, plan.kbps);
+      log(`Encode ${plan.label} ${width}×${height} @ ${plan.kbps}k → ${encoded.size} bytes`);
+
+      if (encoded.size <= GROUP_VIDEO_MAX_BYTES) return encoded;
+    }
+
+    throw new Error(
+      `Video could not be compressed below ${Math.round(GROUP_VIDEO_MAX_BYTES / 1024 / 1024)} MB (tried 1080p/720p and lower bitrates).`
+    );
+  }
+
+  function formatGpError(err) {
+    if (!err) return 'Unknown error';
+    if (typeof err === 'string') return err;
+    return err.message || String(err);
+  }
+
+  function getBestMediaRecorderMimeType() {
+    const candidates = ['video/webm;codecs=vp9', 'video/webm;codecs=vp8', 'video/webm', 'video/mp4'];
+    for (const type of candidates) {
+      if (typeof MediaRecorder !== 'undefined' && MediaRecorder.isTypeSupported(type)) return type;
+    }
+    return 'video/webm';
+  }
+
+  async function loadVideoElement(blob) {
+    const objectUrl = URL.createObjectURL(blob);
+    const video = document.createElement('video');
+    video.muted = false;
+    video.volume = 0;
+    video.playsInline = true;
+    video.preload = 'auto';
+    video.src = objectUrl;
+    await new Promise((resolve, reject) => {
+      video.onloadedmetadata = () => resolve();
+      video.onerror = () => reject(new Error('Could not load video for compression'));
+    });
+    return { video, objectUrl };
+  }
+
+  async function recordVideoToBlob(video, width, height, videoBitsPerSecond, mimeType, durationSec) {
+    await new Promise((resolve, reject) => {
+      const onSeeked = () => {
+        video.removeEventListener('seeked', onSeeked);
+        resolve();
+      };
+      video.addEventListener('seeked', onSeeked);
+      video.addEventListener('error', () => reject(new Error('Video seek failed during compression')), { once: true });
+      video.currentTime = 0;
+    });
+
+    const canvas = document.createElement('canvas');
+    canvas.width = width;
+    canvas.height = height;
+    const ctx = canvas.getContext('2d', { alpha: false });
+    const canvasStream = canvas.captureStream(30);
+
+    let combinedStream = canvasStream;
+    try {
+      if (typeof video.captureStream === 'function') {
+        const srcStream = video.captureStream();
+        const audioTracks = srcStream.getAudioTracks();
+        if (audioTracks.length) {
+          combinedStream = new MediaStream([...canvasStream.getVideoTracks(), ...audioTracks]);
+        }
+      }
+    } catch (_) { /* no audio */ }
+
+    const recorder = new MediaRecorder(combinedStream, { mimeType, videoBitsPerSecond });
+    const chunks = [];
+
+    return new Promise((resolve, reject) => {
+      let rafId = 0;
+      const cleanup = () => {
+        cancelAnimationFrame(rafId);
+        video.pause();
+        combinedStream.getTracks().forEach(track => track.stop());
+      };
+
+      recorder.ondataavailable = e => {
+        if (e.data?.size) chunks.push(e.data);
+      };
+
+      const safetyMs = Math.max(15000, Math.ceil((durationSec + 8) * 1000));
+      const safetyTimer = setTimeout(() => {
+        if (recorder.state === 'recording') {
+          video.pause();
+          recorder.stop();
+        }
+      }, safetyMs);
+
+      recorder.onstop = () => {
+        clearTimeout(safetyTimer);
+        cleanup();
+        resolve(new Blob(chunks, { type: mimeType.split(';')[0] }));
+      };
+      recorder.onerror = () => {
+        clearTimeout(safetyTimer);
+        cleanup();
+        reject(recorder.error || new Error('MediaRecorder failed while compressing video'));
+      };
+
+      const draw = () => {
+        ctx.drawImage(video, 0, 0, width, height);
+        if (!video.paused && !video.ended) rafId = requestAnimationFrame(draw);
+      };
+
+      video.onended = () => {
+        if (recorder.state === 'recording') recorder.stop();
+      };
+
+      recorder.start(500);
+      video.playbackRate = 1;
+      video.play().then(() => draw()).catch(err => {
+        clearTimeout(safetyTimer);
+        cleanup();
+        reject(err);
+      });
+    });
+  }
+
+  async function compressVideoWithMediaRecorder(blob, onProgress) {
+    if (typeof MediaRecorder === 'undefined') {
+      throw new Error('MediaRecorder is not available in this browser');
+    }
+
+    const { video, objectUrl } = await loadVideoElement(blob);
+    try {
+      const srcW = video.videoWidth;
+      const srcH = video.videoHeight;
+      const duration = video.duration;
+      if (!srcW || !srcH || !duration || !Number.isFinite(duration)) {
+        throw new Error('Could not read video dimensions or duration');
+      }
+
+      const mimeType = getBestMediaRecorderMimeType();
+      return await tryGroupVideoEncodePlans(
+        srcW,
+        srcH,
+        duration,
+        (width, height, kbps) =>
+          recordVideoToBlob(video, width, height, kbps * 1000, mimeType, duration),
+        onProgress,
+        'Browser encoder'
+      );
+    } finally {
+      video.src = '';
+      URL.revokeObjectURL(objectUrl);
+    }
+  }
+
+  async function compressVideoForGroupUpload(blob, onProgress) {
+    if (!(blob instanceof Blob) || blob.size <= GROUP_VIDEO_MAX_BYTES) return blob;
+    return compressVideoWithMediaRecorder(blob, onProgress);
   }
 
   // ── Add selected items to a Google Photos album (DOM automation) ───────────
@@ -1130,7 +1386,6 @@
     }
     if (!queue?.length) return;
 
-    await clearQueue();
     log(`Processing ${queue.length} file(s).`);
 
     try {
@@ -1146,15 +1401,19 @@
       if (!composeBox) {
         alert(
           '[GP→Messenger] Could not find a Messenger chat compose box.\n\n' +
-          'Make sure you have a conversation open at facebook.com/messages/t/…\n\n' +
-          'Your files have been re-queued — navigate to a chat and wait a few seconds.'
+          'Make sure you have a conversation open at facebook.com/messages/t/…'
         );
-        await saveQueue(queue);
         return;
+      }
+
+      const isGroupChat = isGroupMessengerChat();
+      if (isGroupChat) {
+        log('Group chat detected — videos over 25 MB: try 1080p@4Mbps, then 720p@3Mbps, then lower bitrate.');
       }
 
       const files = [];
       for (const item of queue) {
+        let file;
         if (item.transferMode === 'remoteFetch') {
           showPanel(`Downloading large video for Messenger: ${item.filename}…`);
           try {
@@ -1162,7 +1421,7 @@
             if (!remoteBlob || remoteBlob.size === 0 || !hasExpectedMimeType(remoteBlob, 'video')) {
               throw new Error(`Invalid delayed video blob type: ${remoteBlob ? remoteBlob.type || 'unknown' : 'empty blob'}`);
             }
-            files.push(new File([remoteBlob], item.filename, { type: item.mimeType || remoteBlob.type || 'video/mp4' }));
+            file = new File([remoteBlob], item.filename, { type: item.mimeType || remoteBlob.type || 'video/mp4' });
           } finally {
             hidePanel();
           }
@@ -1170,8 +1429,30 @@
           const bin   = atob(item.dataUrl.split(',')[1]);
           const bytes = new Uint8Array(bin.length);
           for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
-          files.push(new File([bytes], item.filename, { type: item.mimeType }));
+          file = new File([bytes], item.filename, { type: item.mimeType });
         }
+
+        if (
+          isGroupChat &&
+          file.type.startsWith('video/') &&
+          file.size > GROUP_VIDEO_MAX_BYTES
+        ) {
+          showPanel(`Compressing ${file.name} for group chat (25 MB limit)…`);
+          try {
+            const compressed = await compressVideoForGroupUpload(file, updatePanel);
+            const outType = compressed.type || file.type;
+            file = new File(
+              [compressed],
+              filenameWithExtension(file.name, outType),
+              { type: outType }
+            );
+            log(`Compressed ${item.filename}: ${file.size} bytes`);
+          } finally {
+            hidePanel();
+          }
+        }
+
+        files.push(file);
       }
 
       const fileInput = await waitFor(
@@ -1186,7 +1467,13 @@
 
       if (fileInput) {
         const dt = new DataTransfer();
-        files.forEach(f => dt.items.add(f));
+        for (const f of files) {
+          try {
+            dt.items.add(f);
+          } catch (attachErr) {
+            throw new Error(`Could not attach "${f.name}": ${formatGpError(attachErr)}`);
+          }
+        }
         fileInput.files = dt.files;
         fileInput.dispatchEvent(new Event('change', { bubbles: true }));
         log('Files injected via file input.');
@@ -1196,13 +1483,26 @@
         await sleep(200);
 
         const dt = new DataTransfer();
-        files.forEach(f => dt.items.add(f));
+        for (const f of files) {
+          try {
+            dt.items.add(f);
+          } catch (attachErr) {
+            throw new Error(`Could not attach "${f.name}": ${formatGpError(attachErr)}`);
+          }
+        }
 
-        const pasteEvent = new ClipboardEvent('paste', {
-          bubbles: true,
-          cancelable: true,
-          clipboardData: dt,
-        });
+        let pasteEvent;
+        try {
+          pasteEvent = new ClipboardEvent('paste', {
+            bubbles: true,
+            cancelable: true,
+            clipboardData: dt,
+          });
+        } catch (clipErr) {
+          throw new Error(
+            `Could not attach files (clipboard fallback unsupported): ${formatGpError(clipErr)}`
+          );
+        }
         composeBox.dispatchEvent(pasteEvent);
         log('Paste event dispatched.');
       }
@@ -1224,16 +1524,16 @@
         );
         log('Sent via Enter key fallback.');
       }
+
+      await clearQueue();
+      log('Queue cleared after successful send.');
     } catch (err) {
-      warn('Messenger send flow failed; restoring queue for retry:', err);
-      try {
-        await saveQueue(queue);
-      } catch (saveErr) {
-        warn('Failed to restore queue after send failure:', saveErr);
-      }
+      warn('Messenger send flow failed:', err);
       alert(
-        '[GP→Messenger] Sending failed, and your queue was restored.\n\n' +
-        'Open a Messenger chat and click the button again to retry.'
+        '[GP→Messenger] Sending failed.\n\n' +
+        `${formatGpError(err)}\n\n` +
+        'Your queue is still saved — open a chat and click the button again to retry.\n' +
+        'Check the browser console (filter: GP→Messenger) for details.'
       );
     }
   }
