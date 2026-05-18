@@ -32,6 +32,8 @@
   const ALBUM_NAME_KEY = 'gp2messenger_album_name';
   const BUTTON_ID   = 'gp2m-send-btn';
   const PANEL_ID    = 'gp2m-panel';
+  const PANEL_PROGRESS_ID = 'gp2m-panel-progress';
+  const PANEL_MESSAGE_ID = 'gp2m-panel-message';
   const INPUT_WRAPPER_ID = 'gp2m-input-wrapper';
   const ALBUM_INPUT_ID = 'gp2m-album-input';
   const MAX_FILES   = 10;
@@ -657,7 +659,8 @@
       const { width, height } = dimensionsForShortSide(srcW, srcH, plan.shortSide);
       const prefix = encoderLabel ? `${encoderLabel}, ` : '';
       onProgress?.(
-        `${prefix}${plan.label} ${width}×${height} @ ${plan.kbps} kbps…`
+        `${prefix}${plan.label} ${width}×${height} @ ${plan.kbps} kbps…`,
+        0
       );
       const encoded = await encodeFn(width, height, plan.kbps);
       log(`Encode ${plan.label} ${width}×${height} @ ${plan.kbps}k → ${encoded.size} bytes`);
@@ -684,10 +687,19 @@
     return 'video/webm';
   }
 
+  function formatDuration(seconds) {
+    const sec = Math.max(0, Math.floor(seconds));
+    const hrs = Math.floor(sec / 3600);
+    const mins = Math.floor((sec % 3600) / 60);
+    const secs = sec % 60;
+    const padded = (value) => value.toString().padStart(2, '0');
+    return hrs > 0 ? `${hrs}:${padded(mins)}:${padded(secs)}` : `${mins}:${padded(secs)}`;
+  }
+
   async function loadVideoElement(blob) {
     const objectUrl = URL.createObjectURL(blob);
     const video = document.createElement('video');
-    video.muted = false;
+    video.muted = true;
     video.volume = 0;
     video.playsInline = true;
     video.preload = 'auto';
@@ -699,7 +711,7 @@
     return { video, objectUrl };
   }
 
-  async function recordVideoToBlob(video, width, height, videoBitsPerSecond, mimeType, durationSec) {
+  async function recordVideoToBlob(video, width, height, videoBitsPerSecond, mimeType, durationSec, onProgress) {
     await new Promise((resolve, reject) => {
       const onSeeked = () => {
         video.removeEventListener('seeked', onSeeked);
@@ -731,9 +743,10 @@
     const chunks = [];
 
     return new Promise((resolve, reject) => {
-      let rafId = 0;
+      let intervalId = 0;
+      let lastProgress = -1;
       const cleanup = () => {
-        cancelAnimationFrame(rafId);
+        if (intervalId) clearInterval(intervalId);
         video.pause();
         combinedStream.getTracks().forEach(track => track.stop());
       };
@@ -761,9 +774,21 @@
         reject(recorder.error || new Error('MediaRecorder failed while compressing video'));
       };
 
+      const frameMs = 1000 / 30; // 30fps
       const draw = () => {
         ctx.drawImage(video, 0, 0, width, height);
-        if (!video.paused && !video.ended) rafId = requestAnimationFrame(draw);
+      };
+
+      const reportProgress = () => {
+        const current = Math.min(video.currentTime, durationSec);
+        const progress = durationSec > 0 ? Math.round((current / durationSec) * 100) : 0;
+        if (progress !== lastProgress) {
+          lastProgress = progress;
+          onProgress?.(
+            `${formatDuration(current)} / ${formatDuration(durationSec)}`,
+            progress
+          );
+        }
       };
 
       video.onended = () => {
@@ -772,7 +797,18 @@
 
       recorder.start(500);
       video.playbackRate = 1;
-      video.play().then(() => draw()).catch(err => {
+      video.play().then(() => {
+        intervalId = setInterval(() => {
+          if (recorder.state !== 'recording') return;
+          if (video.ended) {
+            recorder.stop();
+            return;
+          }
+
+          draw();
+          reportProgress();
+        }, frameMs);
+      }).catch(err => {
         clearTimeout(safetyTimer);
         cleanup();
         reject(err);
@@ -800,7 +836,7 @@
         srcH,
         duration,
         (width, height, kbps) =>
-          recordVideoToBlob(video, width, height, kbps * 1000, mimeType, duration),
+          recordVideoToBlob(video, width, height, kbps * 1000, mimeType, duration, onProgress),
         onProgress,
         'Browser encoder'
       );
@@ -814,6 +850,9 @@
     if (!(blob instanceof Blob) || blob.size <= GROUP_VIDEO_MAX_BYTES) return blob;
     return compressVideoWithMediaRecorder(blob, onProgress);
   }
+
+
+
 
   // ── Add selected items to a Google Photos album (DOM automation) ───────────
   function gpNorm(s) {
@@ -1207,12 +1246,98 @@
     GM_openInTab('https://www.facebook.com/messages/', { active: true, insert: true });
   }
 
+  function clearElement(el) {
+    while (el.firstChild) el.removeChild(el.firstChild);
+  }
+
   function showPanel(msg) {
     let p = document.getElementById(PANEL_ID);
     if (!p) { p = document.createElement('div'); p.id = PANEL_ID; document.body.appendChild(p); }
-    p.textContent = msg; p.style.display = 'flex';
+    clearElement(p);
+    const msgEl = document.createElement('div');
+    msgEl.id = PANEL_MESSAGE_ID;
+    msgEl.textContent = msg;
+    p.appendChild(msgEl);
+    p.style.display = 'flex';
   }
-  function updatePanel(msg) { const p = document.getElementById(PANEL_ID); if (p) p.textContent = msg; }
+
+  function updatePanel(msg) {
+    const p = document.getElementById(PANEL_ID);
+    if (!p) return;
+    const msgEl = document.getElementById(PANEL_MESSAGE_ID);
+    if (msgEl) {
+      msgEl.textContent = msg;
+    } else {
+      clearElement(p);
+      const newMsgEl = document.createElement('div');
+      newMsgEl.id = PANEL_MESSAGE_ID;
+      newMsgEl.textContent = msg;
+      p.appendChild(newMsgEl);
+    }
+  }
+
+  function showProgressPanel(msg) {
+    let p = document.getElementById(PANEL_ID);
+    if (!p) {
+      p = document.createElement('div');
+      p.id = PANEL_ID;
+      document.body.appendChild(p);
+    }
+    clearElement(p);
+
+    // Create message container
+    const msgContainer = document.createElement('div');
+    msgContainer.style.display = 'flex';
+    msgContainer.style.flexDirection = 'column';
+    msgContainer.style.gap = '10px';
+    msgContainer.style.width = '100%';
+
+    // Message text
+    const msgEl = document.createElement('div');
+    msgEl.id = PANEL_MESSAGE_ID;
+    msgEl.textContent = msg;
+    msgContainer.appendChild(msgEl);
+
+    // Progress bar
+    const progressBar = document.createElement('progress');
+    progressBar.id = PANEL_PROGRESS_ID;
+    progressBar.style.width = '100%';
+    progressBar.style.height = '6px';
+    progressBar.value = 0;
+    progressBar.max = 100;
+    msgContainer.appendChild(progressBar);
+
+    // Warning text
+    const warningEl = document.createElement('div');
+    warningEl.style.fontSize = '12px';
+    warningEl.style.color = '#ff9800';
+    warningEl.style.fontWeight = '600';
+    warningEl.style.marginTop = '4px';
+    warningEl.textContent = '⚠️ DON\'T SWITCH TABS!';
+    msgContainer.appendChild(warningEl);
+
+    p.appendChild(msgContainer);
+    p.style.display = 'flex';
+  }
+
+  function updateProgressPanel(msg, progress) {
+    let p = document.getElementById(PANEL_ID);
+    if (!p) {
+      showProgressPanel(msg);
+      p = document.getElementById(PANEL_ID);
+    }
+
+    const msgEl = document.getElementById(PANEL_MESSAGE_ID);
+    if (msgEl) {
+      msgEl.textContent = msg;
+    }
+
+    const progressBar = document.getElementById(PANEL_PROGRESS_ID);
+    if (progressBar && typeof progress === 'number') {
+      progressBar.value = Math.min(100, Math.max(0, progress));
+    }
+  }
+
   function hidePanel() { const p = document.getElementById(PANEL_ID); if (p) p.style.display = 'none'; }
 
   function injectStyles() {
@@ -1276,19 +1401,42 @@
       }
       #${PANEL_ID} {
         align-items: center;
+        justify-content: center;
         background: rgba(0, 0, 0, 0.85);
         border-radius: 10px;
         bottom: 30px;
         color: #fff;
         display: none;
         font-size: 14px;
-        justify-content: center;
         left: 50%;
         padding: 16px 24px;
         position: fixed;
         transform: translateX(-50%);
         z-index: 99999;
         font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+        min-width: 300px;
+        max-width: 450px;
+      }
+      #${PANEL_PROGRESS_ID} {
+        width: 100%;
+        height: 6px;
+        border: none;
+        border-radius: 3px;
+        background-color: rgba(255, 255, 255, 0.2);
+        appearance: none;
+        -webkit-appearance: none;
+      }
+      #${PANEL_PROGRESS_ID}::-webkit-progress-bar {
+        background-color: rgba(255, 255, 255, 0.2);
+        border-radius: 3px;
+      }
+      #${PANEL_PROGRESS_ID}::-webkit-progress-value {
+        background: linear-gradient(90deg, #1877f2, #0a50be);
+        border-radius: 3px;
+      }
+      #${PANEL_PROGRESS_ID}::-moz-progress-bar {
+        background: linear-gradient(90deg, #1877f2, #0a50be);
+        border-radius: 3px;
       }
     `;
     const target = document.head || document.documentElement || document.body;
@@ -1437,9 +1585,15 @@
           file.type.startsWith('video/') &&
           file.size > GROUP_VIDEO_MAX_BYTES
         ) {
-          showPanel(`Compressing ${file.name} for group chat (25 MB limit)…`);
+          showProgressPanel(`Compressing ${file.name} for group chat (25 MB limit)…`);
           try {
-            const compressed = await compressVideoForGroupUpload(file, updatePanel);
+            const progressCallback = (msg, progress) => {
+              updateProgressPanel(
+                `Compressing ${file.name} for group chat (25 MB limit)…\n${msg}`,
+                typeof progress === 'number' ? progress : 0
+              );
+            };
+            const compressed = await compressVideoForGroupUpload(file, progressCallback);
             const outType = compressed.type || file.type;
             file = new File(
               [compressed],
